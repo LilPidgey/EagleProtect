@@ -9,7 +9,8 @@ namespace eagle::dasm
     {
     }
 
-    std::vector<basic_block_ptr> segment_dasm::explore_blocks(const uint64_t entry_rva)
+    std::vector<basic_block_ptr> segment_dasm::explore_blocks(const uint64_t entry_rva,
+        std::optional<std::reference_wrapper<std::unordered_map<basic_block_ptr, uint32_t>>> discovery_depth)
     {
         std::vector<basic_block_ptr> collected_blocks;
 
@@ -18,6 +19,7 @@ namespace eagle::dasm
         explore_queue.push(entry_rva);
         discovered.insert(entry_rva);
 
+        uint32_t depth = 0;
         while (!explore_queue.empty())
         {
             const size_t layer_size = explore_queue.size();
@@ -48,6 +50,12 @@ namespace eagle::dasm
                             prev->end_rva_inc += block_inst.instruction.length;
                         }
 
+                        if (discovery_depth)
+                        {
+                            auto& map = discovery_depth->get();
+                            map[prev] = depth;
+                        }
+
                         // this means there is some tricky control flow happening
                         // for instance, there may be an opaque branch to some garbage code
                         // another reason could be is we explored the wrong branch first of some obfuscated code and found garbage
@@ -63,8 +71,14 @@ namespace eagle::dasm
                 if (should_continue)
                     continue;
 
-                auto block = std::make_shared<basic_block>();
+                basic_block_ptr block = std::make_shared<basic_block>();
                 block->start_rva = layer_rva;
+
+                if (discovery_depth)
+                {
+                    auto& map = discovery_depth->get();
+                    map[block] = depth;
+                }
 
                 uint32_t current_rva = layer_rva;
                 while (true)
@@ -115,6 +129,8 @@ namespace eagle::dasm
                 block->end_rva_inc = current_rva;
                 collected_blocks.push_back(block);
             }
+
+            depth++;
         }
 
         // i will just say, this is an insane way to do it,

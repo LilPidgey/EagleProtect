@@ -105,7 +105,7 @@ void process_entry(const virt::eg::settings_ptr& machine_settings, const nlohman
     codec::decode_vec instructions = codec::get_instructions(instruction_data.data(), instruction_data.size());
 
     dasm::segment_dasm_ptr dasm = std::make_shared<dasm::segment_dasm>(0, instruction_data.data(), instruction_data.size());
-    dasm->explore_blocks(0);
+    dasm->explore_blocks(0, TODO);
 
     std::shared_ptr<ir::ir_translator> ir_trans = std::make_shared<ir::ir_translator>(dasm);
     ir::preopt_block_vec preopt = ir_trans->translate();

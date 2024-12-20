@@ -31,9 +31,11 @@ namespace eagle::dasm
         /// @brief given an entry address, the function will return a set of basic blocks
         /// which are explored by the control flow of the given instructions
         /// @param entry_rva rva at which the control flow begins
+        /// @param discovery_depth
         /// @return basic blocks which represent the generated control flow
         /// @ensures out = set of basic blocks representing the control flow
-        virtual std::vector<basic_block_ptr> explore_blocks(uint64_t entry_rva) = 0;
+        virtual std::vector<basic_block_ptr> explore_blocks(uint64_t entry_rva,
+            std::optional<std::reference_wrapper<std::unordered_map<basic_block_ptr, uint32_t>>> discovery_depth) = 0;
 
         /// @brief gets all the instructions in a certain section and disregards the flow of the instructions
         /// @param rva_begin the rva at which the starting instruction is at
@@ -64,9 +66,11 @@ namespace eagle::dasm
         /// @brief given an entry address, the function will return a set of basic blocks
         /// which are explored by the control flow of the given instructions
         /// @param entry_rva rva at which the control flow begins
+        /// @param discovery_depth optional discovery information for basic blocks
         /// @return basic blocks which represent the generated control flow
         /// @ensures out = set of basic blocks representing the control flow
-        std::vector<basic_block_ptr> explore_blocks(uint64_t entry_rva) override;
+        std::vector<basic_block_ptr> explore_blocks(uint64_t entry_rva,
+            std::optional<std::reference_wrapper<std::unordered_map<basic_block_ptr, uint32_t>>> discovery_depth = std::nullopt) override;
 
         /// @brief gets all the instructions in a certain section and disregards the flow of the instructions
         /// @param rva_begin the rva at which the starting instruction is at
@@ -99,7 +103,7 @@ namespace eagle::dasm
         uint64_t rva_base;
         uint8_t* instruction_buffer;
         size_t instruction_size;
-        
+
         std::vector<basic_block_ptr> blocks;
 
         /// @brief decodes an instruction at the specified rva.

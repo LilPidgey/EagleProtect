@@ -23,14 +23,85 @@
 
 using namespace eagle;
 
-void print_graphviz(const std::vector<ir::block_ptr>& blocks, const ir::block_ptr& entry)
+void print_liveness(dasm::analysis::liveness& seg_live, std::vector<dasm::basic_block_ptr>& blocks)
 {
-    std::cout << "digraph ControlFlow {\n  graph [splines=ortho]\n  node [shape=box, fontname=\"Courier\"];\n";
+    for (auto& block : blocks)
+    {
+        printf("\nblock 0x%llx-0x%llx\n", block->start_rva, block->end_rva_inc);
 
-    for (const auto& block : blocks)
+        auto bitfield_to_bitstring = [](const uint64_t value, const auto sig_bits) -> std::string
+        {
+            std::string result;
+            for (int k = sig_bits - 1; k >= 0; --k)
+                result += value & 1 << k ? '1' : '0';
+
+            return result;
+        };
+
+        printf("in: \n");
+        dasm::analysis::liveness_info& item = seg_live.live[block].first;
+        for (int k = ZYDIS_REGISTER_RAX; k <= ZYDIS_REGISTER_R15; k++)
+            if (auto res = item.get_gpr64(static_cast<codec::reg>(k)))
+                printf("\t%s:%s\n", reg_to_string(static_cast<codec::reg>(k)), bitfield_to_bitstring(res, 8).c_str());
+
+        printf("out: \n");
+        item = seg_live.live[block].second;
+        for (int k = ZYDIS_REGISTER_RAX; k <= ZYDIS_REGISTER_R15; k++)
+            if (auto res = item.get_gpr64(static_cast<codec::reg>(k)))
+                printf("\t%s:%s\n", reg_to_string(static_cast<codec::reg>(k)), bitfield_to_bitstring(res, 8).c_str());
+
+        auto block_liveness = seg_live.analyze_block(block);
+
+        printf("insts: \n");
+        for (size_t idx = 0; auto& inst : block->decoded_insts)
+        {
+            std::string inst_string = codec::instruction_to_string(inst);
+            printf("\t%llu. %s\n", idx, inst_string.c_str());
+
+            printf("\tin: \n");
+            for (int k = ZYDIS_REGISTER_RAX; k <= ZYDIS_REGISTER_R15; k++)
+                if (auto res = block_liveness[idx].first.get_gpr64(static_cast<codec::reg>(k)))
+                    printf("\t\t%s:%s\n", reg_to_string(static_cast<codec::reg>(k)), bitfield_to_bitstring(res, 8).c_str());
+
+            if (auto res = block_liveness[idx].first.get_flags())
+                printf("\t\trflags:%s\n", bitfield_to_bitstring(res, 32).c_str());
+
+            printf("\tout: \n");
+            for (int k = ZYDIS_REGISTER_RAX; k <= ZYDIS_REGISTER_R15; k++)
+                if (auto res = block_liveness[idx].second.get_gpr64(static_cast<codec::reg>(k)))
+                    printf("\t\t%s:%s\n", reg_to_string(static_cast<codec::reg>(k)), bitfield_to_bitstring(res, 8).c_str());
+
+            if (auto res = block_liveness[idx].second.get_flags())
+                printf("\t\trflags:%s\n", bitfield_to_bitstring(res, 32).c_str());
+
+            idx++;
+        }
+    }
+}
+
+void print_ir_graphviz(const std::vector<ir::block_ptr>& blocks,
+    const ir::block_ptr& entry, std::unordered_map<ir::block_ptr, uint32_t>& depth)
+{
+    // Collect nodes by depth
+    std::map<uint32_t, std::vector<std::string>> depth_map;
+
+    std::cout << "digraph ControlFlow {\n"
+        "  graph [splines=ortho]\n"
+        "  node [shape=box, fontname=\"Courier\"];\n";
+
+    // We'll store edges until after we print all nodes
+    std::vector<std::string> edges;
+
+    for (const ir::block_ptr& block : blocks)
     {
         const std::string node_id = std::format("0x{:x}", block->block_id);
         std::string graph_title = (block == entry) ? node_id + " (entry)" : node_id;
+
+        VM_ASSERT(depth.contains(block), "depth map must contain the basic block being printed");
+        uint32_t d = depth[block];
+
+        // Add node to the depth map
+        depth_map[d].push_back(node_id);
 
         std::ostringstream insts_nodes;
         for (const auto& inst : *block)
@@ -52,7 +123,7 @@ void print_graphviz(const std::vector<ir::block_ptr>& blocks, const ir::block_pt
                 branches = vmexit->get_branches();
 
             for (const auto& call : ptr_virt->get_calls())
-                std::cout << std::format("  \"{}\" -> \"0x{:x}\";\n", node_id, call->block_id);
+                edges.push_back(std::format("  \"{}\" -> \"0x{:x}\";\n", node_id, call->block_id));
         }
         else if (auto ptr_x86 = block->as_x86())
         {
@@ -68,13 +139,23 @@ void print_graphviz(const std::vector<ir::block_ptr>& blocks, const ir::block_pt
             else
                 target_id = std::format("0x{:x}", std::get<uint64_t>(branch));
 
-            std::cout << std::format("  \"{}\" -> \"{}\";\n", node_id, target_id);
+            edges.push_back(std::format("  \"{}\" -> \"{}\";\n", node_id, target_id));
         }
+    }
+
+    for (const auto& e : edges)
+        std::cout << e;
+
+    for (const auto& [d, nodes] : depth_map)
+    {
+        std::cout << "  { rank=same; ";
+        for (const auto& n : nodes)
+            std::cout << "\"" << n << "\"; ";
+        std::cout << "}\n";
     }
 
     std::cout << "}\n" << std::flush;
 }
-
 
 void print_ir(const std::vector<ir::block_ptr>& blocks, const ir::block_ptr& entry)
 {
@@ -324,64 +405,15 @@ int main(int argc, char* argv[])
          */
 
         dasm::segment_dasm_ptr dasm = std::make_shared<dasm::segment_dasm>(rva_inst_begin, pinst_begin, rva_inst_end - rva_inst_begin);
-        std::vector result = dasm->explore_blocks(rva_inst_begin);
+
+        std::unordered_map<dasm::basic_block_ptr, uint32_t> bb_discovery_depth;
+        std::vector result = dasm->explore_blocks(rva_inst_begin, bb_discovery_depth);
 
         dasm::analysis::liveness seg_live(dasm);
         seg_live.compute_blocks_use_def();
         seg_live.analyze_cross_liveness(result.back());
 
-        for (auto& block : dasm->get_blocks())
-        {
-            printf("\nblock 0x%llx-0x%llx\n", block->start_rva, block->end_rva_inc);
-
-            auto bitfield_to_bitstring = [](const uint64_t value, const auto sig_bits) -> std::string
-            {
-                std::string result;
-                for (int k = sig_bits - 1; k >= 0; --k)
-                    result += value & 1 << k ? '1' : '0';
-
-                return result;
-            };
-
-            printf("in: \n");
-            dasm::analysis::liveness_info& item = seg_live.live[block].first;
-            for (int k = ZYDIS_REGISTER_RAX; k <= ZYDIS_REGISTER_R15; k++)
-                if (auto res = item.get_gpr64(static_cast<codec::reg>(k)))
-                    printf("\t%s:%s\n", reg_to_string(static_cast<codec::reg>(k)), bitfield_to_bitstring(res, 8).c_str());
-
-            printf("out: \n");
-            item = seg_live.live[block].second;
-            for (int k = ZYDIS_REGISTER_RAX; k <= ZYDIS_REGISTER_R15; k++)
-                if (auto res = item.get_gpr64(static_cast<codec::reg>(k)))
-                    printf("\t%s:%s\n", reg_to_string(static_cast<codec::reg>(k)), bitfield_to_bitstring(res, 8).c_str());
-
-            auto block_liveness = seg_live.analyze_block(block);
-
-            printf("insts: \n");
-            for (size_t idx = 0; auto& inst : block->decoded_insts)
-            {
-                std::string inst_string = codec::instruction_to_string(inst);
-                printf("\t%llu. %s\n", idx, inst_string.c_str());
-
-                printf("\tin: \n");
-                for (int k = ZYDIS_REGISTER_RAX; k <= ZYDIS_REGISTER_R15; k++)
-                    if (auto res = block_liveness[idx].first.get_gpr64(static_cast<codec::reg>(k)))
-                        printf("\t\t%s:%s\n", reg_to_string(static_cast<codec::reg>(k)), bitfield_to_bitstring(res, 8).c_str());
-
-                if (auto res = block_liveness[idx].first.get_flags())
-                    printf("\t\trflags:%s\n", bitfield_to_bitstring(res, 32).c_str());
-
-                printf("\tout: \n");
-                for (int k = ZYDIS_REGISTER_RAX; k <= ZYDIS_REGISTER_R15; k++)
-                    if (auto res = block_liveness[idx].second.get_gpr64(static_cast<codec::reg>(k)))
-                        printf("\t\t%s:%s\n", reg_to_string(static_cast<codec::reg>(k)), bitfield_to_bitstring(res, 8).c_str());
-
-                if (auto res = block_liveness[idx].second.get_flags())
-                    printf("\t\trflags:%s\n", bitfield_to_bitstring(res, 32).c_str());
-
-                idx++;
-            }
-        }
+        print_liveness(seg_live, dasm->get_blocks());
 
         std::printf("[>] dasm found %llu basic blocks\n", dasm->get_blocks().size());
         std::cout << std::endl;
@@ -406,6 +438,20 @@ int main(int argc, char* argv[])
             if (preopt_block->original_block == dasm->get_block(rva_inst_begin, false))
                 entry_block = preopt_block;
 
+        std::unordered_map<ir::block_ptr, uint32_t> ir_estimate_discovery_depth;
+        for (const auto& preopt_block : preopt)
+        {
+            VM_ASSERT(bb_discovery_depth.contains(preopt_block->original_block),
+                "dissasembly must contain information about original block to map depth");
+
+            auto depth = bb_discovery_depth[preopt_block->original_block];
+            ir_estimate_discovery_depth[preopt_block->head] = depth;
+            ir_estimate_discovery_depth[preopt_block->tail] = depth;
+
+            for (auto& body : preopt_block->body)
+                ir_estimate_discovery_depth[body] = depth;
+        }
+
         VM_ASSERT(entry_block != nullptr, "could not find matching preopt block for entry block");
 
         // if we want, we can do a little optimzation which will rewrite the preopt
@@ -424,6 +470,9 @@ int main(int argc, char* argv[])
         {
             std::vector<ir::block_ptr> handler_blocks = ir::obfuscator::create_merged_handlers(blocks);
             blocks.append_range(handler_blocks);
+
+            for (auto& block : handler_blocks)
+                ir_estimate_discovery_depth[block] = -1;
 
             // restore calls, for whatever debug reason
             //for (auto& block : blocks)
@@ -489,7 +538,7 @@ int main(int argc, char* argv[])
                 vm_section.add_code_container(result_container);
             }
 
-            print_graphviz(blocks, block_tracker[entry_block]);
+            print_ir_graphviz(blocks, block_tracker[entry_block], ir_estimate_discovery_depth);
 
             // build handlers
             std::vector<asmb::code_container_ptr> handler_containers = machine->create_handlers();
