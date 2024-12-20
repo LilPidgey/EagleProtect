@@ -53,7 +53,7 @@ namespace eagle::dasm
                         if (discovery_depth)
                         {
                             auto& map = discovery_depth->get();
-                            map[prev] = depth;
+                            map[prev] = depth++;
                         }
 
                         // this means there is some tricky control flow happening
@@ -77,7 +77,7 @@ namespace eagle::dasm
                 if (discovery_depth)
                 {
                     auto& map = discovery_depth->get();
-                    map[block] = depth;
+                    map[block] = depth++;
                 }
 
                 uint32_t current_rva = layer_rva;
@@ -129,8 +129,6 @@ namespace eagle::dasm
                 block->end_rva_inc = current_rva;
                 collected_blocks.push_back(block);
             }
-
-            depth++;
         }
 
         // i will just say, this is an insane way to do it,

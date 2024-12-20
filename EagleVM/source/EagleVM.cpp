@@ -79,83 +79,105 @@ void print_liveness(dasm::analysis::liveness& seg_live, std::vector<dasm::basic_
     }
 }
 
-void print_ir_graphviz(const std::vector<ir::block_ptr>& blocks,
-    const ir::block_ptr& entry, std::unordered_map<ir::block_ptr, uint32_t>& depth)
+void print_ir_graphviz(
+    const std::vector<std::pair<uint32_t, std::vector<ir::block_ptr>>>& grouped_blocks,
+    const ir::block_ptr& entry,
+    const std::vector<ir::block_ptr>& alternative_handlers)
 {
-    // Collect nodes by depth
-    std::map<uint32_t, std::vector<std::string>> depth_map;
-
     std::cout << "digraph ControlFlow {\n"
-        "  graph [splines=ortho]\n"
-        "  node [shape=box, fontname=\"Courier\"];\n";
+        << "  graph [splines=ortho, rankdir=LR]\n" // Set graph direction to top-to-bottom
+        << "  node [shape=box, fontname=\"Courier\"];\n";
 
-    // We'll store edges until after we print all nodes
     std::vector<std::string> edges;
-
-    for (const ir::block_ptr& block : blocks)
+    std::map<uint32_t, std::vector<std::string>> depth_map;
+    for (const auto& [group_depth, blocks] : grouped_blocks)
     {
-        const std::string node_id = std::format("0x{:x}", block->block_id);
-        std::string graph_title = (block == entry) ? node_id + " (entry)" : node_id;
+        for (const ir::block_ptr& block : blocks)
+        {
+            const std::string node_id = std::format("0x{:x}", block->block_id);
+            std::string graph_title = block == entry ? node_id + " (entry)" : node_id;
 
-        VM_ASSERT(depth.contains(block), "depth map must contain the basic block being printed");
-        uint32_t d = depth[block];
+            // Add node to the depth map
+            depth_map[group_depth].push_back(node_id);
 
-        // Add node to the depth map
-        depth_map[d].push_back(node_id);
+            std::ostringstream insts_nodes;
+            for (const auto& inst : *block)
+                insts_nodes << std::format("<TR><TD ALIGN=\"LEFT\">{}</TD></TR>", inst->to_string());
+
+            std::cout << std::format(
+                "  \"{}\" [label=<<TABLE BORDER=\"0\">"
+                "<TR><TD ALIGN=\"CENTER\"><B>block {}</B></TD></TR>"
+                "{}"
+                "</TABLE>>];\n",
+                node_id, graph_title, insts_nodes.str());
+
+            std::vector<ir::ir_exit_result> branches;
+            if (const auto ptr_virt = block->as_virt())
+            {
+                if (const auto exit = ptr_virt->exit_as_branch())
+                    branches = exit->get_branches();
+                else if (const auto vmexit = ptr_virt->exit_as_vmexit())
+                    branches = vmexit->get_branches();
+
+                for (const auto& call : ptr_virt->get_calls())
+                    edges.push_back(std::format("  \"{}\" -> \"0x{:x}\";\n", node_id, call->block_id));
+            }
+            else if (auto ptr_x86 = block->as_x86())
+            {
+                if (const auto exit = ptr_x86->exit_as_branch())
+                    branches = exit->get_branches();
+            }
+
+            for (const auto& branch : branches)
+            {
+                std::string target_id;
+                if (std::holds_alternative<ir::block_ptr>(branch))
+                    target_id = std::format("0x{:x}", std::get<ir::block_ptr>(branch)->block_id);
+                else
+                    target_id = std::format("0x{:x}", std::get<uint64_t>(branch));
+
+                edges.push_back(std::format("  \"{}\" -> \"{}\";\n", node_id, target_id));
+            }
+        }
+    }
+
+    // Process alternative handlers
+    std::vector<std::string> alternative_handler_nodes;
+    for (const ir::block_ptr& handler : alternative_handlers)
+    {
+        const std::string node_id = std::format("0x{:x}", handler->block_id);
 
         std::ostringstream insts_nodes;
-        for (const auto& inst : *block)
+        for (const auto& inst : *handler)
             insts_nodes << std::format("<TR><TD ALIGN=\"LEFT\">{}</TD></TR>", inst->to_string());
 
         std::cout << std::format(
             "  \"{}\" [label=<<TABLE BORDER=\"0\">"
-            "<TR><TD ALIGN=\"CENTER\"><B>block {}</B></TD></TR>"
+            "<TR><TD ALIGN=\"CENTER\"><B>alt block {}</B></TD></TR>"
             "{}"
             "</TABLE>>];\n",
-            node_id, graph_title, insts_nodes.str());
+            node_id, node_id, insts_nodes.str());
 
-        std::vector<ir::ir_exit_result> branches;
-        if (const auto ptr_virt = block->as_virt())
-        {
-            if (const auto exit = ptr_virt->exit_as_branch())
-                branches = exit->get_branches();
-            else if (const auto vmexit = ptr_virt->exit_as_vmexit())
-                branches = vmexit->get_branches();
-
-            for (const auto& call : ptr_virt->get_calls())
-                edges.push_back(std::format("  \"{}\" -> \"0x{:x}\";\n", node_id, call->block_id));
-        }
-        else if (auto ptr_x86 = block->as_x86())
-        {
-            if (const auto exit = ptr_x86->exit_as_branch())
-                branches = exit->get_branches();
-        }
-
-        for (const auto& branch : branches)
-        {
-            std::string target_id;
-            if (std::holds_alternative<ir::block_ptr>(branch))
-                target_id = std::format("0x{:x}", std::get<ir::block_ptr>(branch)->block_id);
-            else
-                target_id = std::format("0x{:x}", std::get<uint64_t>(branch));
-
-            edges.push_back(std::format("  \"{}\" -> \"{}\";\n", node_id, target_id));
-        }
+        alternative_handler_nodes.push_back(node_id);
     }
 
+    // Print edges
     for (const auto& e : edges)
         std::cout << e;
 
-    for (const auto& [d, nodes] : depth_map)
+    for (const auto& [depth, nodes] : depth_map)
     {
-        std::cout << "  { rank=same; ";
+        std::cout << std::format("  subgraph cluster_{} {{\n", depth);
+        std::cout << "    rankdir=TB;\n"; // Force top-to-bottom within the cluster
+        std::cout << "    style=invis;\n"; // Make the border invisible
         for (const auto& n : nodes)
-            std::cout << "\"" << n << "\"; ";
-        std::cout << "}\n";
+            std::cout << "    \"" << n << "\";\n";
+        std::cout << "  }\n";
     }
 
     std::cout << "}\n" << std::flush;
 }
+
 
 void print_ir(const std::vector<ir::block_ptr>& blocks, const ir::block_ptr& entry)
 {
@@ -439,8 +461,10 @@ int main(int argc, char* argv[])
                 entry_block = preopt_block;
 
         std::unordered_map<ir::block_ptr, uint32_t> ir_estimate_discovery_depth;
+        std::vector<std::pair<uint32_t, std::vector<ir::block_ptr>>> block_groups;
         for (const auto& preopt_block : preopt)
         {
+            std::vector<ir::block_ptr> block_group;
             VM_ASSERT(bb_discovery_depth.contains(preopt_block->original_block),
                 "dissasembly must contain information about original block to map depth");
 
@@ -450,6 +474,12 @@ int main(int argc, char* argv[])
 
             for (auto& body : preopt_block->body)
                 ir_estimate_discovery_depth[body] = depth;
+
+            block_group.push_back(preopt_block->head);
+            block_group.append_range(preopt_block->body);
+            block_group.push_back(preopt_block->tail);
+
+            block_groups.emplace_back(depth, block_group);
         }
 
         VM_ASSERT(entry_block != nullptr, "could not find matching preopt block for entry block");
@@ -459,6 +489,39 @@ int main(int argc, char* argv[])
         std::unordered_map<ir::preopt_block_ptr, ir::block_ptr> block_tracker = { { entry_block, nullptr } };
         std::vector<ir::flat_block_vmid> vm_blocks = ir_trans->optimize(block_vm_ids, block_tracker, { entry_block });
 
+
+        for (auto& [depth, block_group] : block_groups)
+        {
+            for (auto it = block_group.begin(); it != block_group.end(); )
+            {
+                bool found = false;
+                for (auto& [blocks_search, vmid] : vm_blocks)
+                {
+                    for (auto& block_search : blocks_search)
+                    {
+                        if (*it == block_search)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (found)
+                        break;
+                }
+
+                if (!found)
+                {
+                    // delete "block" from "block_group"
+                    it = block_group.erase(it);
+                }
+                else
+                {
+                    ++it; // Move to the next block
+                }
+            }
+        }
+
         std::unordered_map<uint32_t, std::vector<ir::block_ptr>> vm_id_map;
         for (auto& [block, vmid] : vm_blocks)
         {
@@ -466,14 +529,17 @@ int main(int argc, char* argv[])
             vm_id_map[vmid].append_range(block);
         }
 
+        std::vector<ir::block_ptr> alternative_handlers;
         for (auto& blocks : vm_id_map | std::views::values)
         {
+            continue;
             std::vector<ir::block_ptr> handler_blocks = ir::obfuscator::create_merged_handlers(blocks);
             blocks.append_range(handler_blocks);
 
             for (auto& block : handler_blocks)
                 ir_estimate_discovery_depth[block] = -1;
 
+            alternative_handlers.append_range(handler_blocks);
             // restore calls, for whatever debug reason
             //for (auto& block : blocks)
             //{
@@ -538,7 +604,7 @@ int main(int argc, char* argv[])
                 vm_section.add_code_container(result_container);
             }
 
-            print_ir_graphviz(blocks, block_tracker[entry_block], ir_estimate_discovery_depth);
+            print_ir_graphviz(block_groups, block_tracker[entry_block], alternative_handlers);
 
             // build handlers
             std::vector<asmb::code_container_ptr> handler_containers = machine->create_handlers();
